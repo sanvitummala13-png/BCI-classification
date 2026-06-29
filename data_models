@@ -1,0 +1,310 @@
+"""
+Data models for EEG dataset representation.
+
+This module defines the core data structures for representing EEG samples,
+epochs, and datasets throughout the pipeline.
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+import numpy as np
+
+
+@dataclass
+class EEGSample:
+    """
+    Represents a single EEG recording sample.
+    
+    Attributes:
+        signal: EEG signal data with shape (n_channels, n_samples)
+        label: Binary classification label (0: Control, 1: AD)
+        subject_id: Unique identifier for the subject
+        channel_names: List of EEG channel names (e.g., ['Fp1', 'Fp2', ...])
+        sampling_rate: Sampling frequency in Hz
+        metadata: Additional information (age, gender, MMSE score, etc.)
+    """
+    signal: np.ndarray
+    label: int
+    subject_id: str
+    channel_names: List[str]
+    sampling_rate: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def validate(self) -> bool:
+        """
+        Validate the integrity of the EEG sample.
+        
+        Returns:
+            True if the sample is valid, False otherwise
+            
+        Raises:
+            ValueError: If validation fails with specific error message
+        """
+        # Check signal shape
+        if self.signal.ndim != 2:
+            raise ValueError(
+                f"Signal must be 2D array (n_channels, n_samples), "
+                f"got shape {self.signal.shape}"
+            )
+        
+        # Check label validity
+        if self.label not in [0, 1]:
+            raise ValueError(
+                f"Label must be 0 (Control) or 1 (AD), got {self.label}"
+            )
+        
+        # Check channel names match signal shape
+        n_channels = self.signal.shape[0]
+        if len(self.channel_names) != n_channels:
+            raise ValueError(
+                f"Number of channel names ({len(self.channel_names)}) "
+                f"does not match signal channels ({n_channels})"
+            )
+        
+        # Check sampling rate is positive
+        if self.sampling_rate <= 0:
+            raise ValueError(
+                f"Sampling rate must be positive, got {self.sampling_rate}"
+            )
+        
+        # Check subject_id is not empty
+        if not self.subject_id or not self.subject_id.strip():
+            raise ValueError("Subject ID cannot be empty")
+        
+        return True
+
+
+@dataclass
+class EEGEpoch:
+    """
+    Represents a fixed-duration segment of EEG signal.
+    
+    Attributes:
+        signal: Epoch signal data with shape (n_channels, epoch_samples)
+        label: Binary classification label (0: Control, 1: AD)
+        subject_id: Unique identifier for the subject
+        epoch_index: Index of this epoch within the subject's recording
+        is_artifact: Flag indicating if epoch contains artifacts
+    """
+    signal: np.ndarray
+    label: int
+    subject_id: str
+    epoch_index: int
+    is_artifact: bool = False
+    
+    def validate(self) -> bool:
+        """
+        Validate the integrity of the EEG epoch.
+        
+        Returns:
+            True if the epoch is valid, False otherwise
+            
+        Raises:
+            ValueError: If validation fails with specific error message
+        """
+        # Check signal shape
+        if self.signal.ndim != 2:
+            raise ValueError(
+                f"Epoch signal must be 2D array (n_channels, epoch_samples), "
+                f"got shape {self.signal.shape}"
+            )
+        
+        # Check label validity
+        if self.label not in [0, 1]:
+            raise ValueError(
+                f"Label must be 0 (Control) or 1 (AD), got {self.label}"
+            )
+        
+        # Check epoch index is non-negative
+        if self.epoch_index < 0:
+            raise ValueError(
+                f"Epoch index must be non-negative, got {self.epoch_index}"
+            )
+        
+        # Check subject_id is not empty
+        if not self.subject_id or not self.subject_id.strip():
+            raise ValueError("Subject ID cannot be empty")
+        
+        return True
+
+
+@dataclass
+class EEGDataset:
+    """
+    Container for a collection of EEG samples.
+    
+    Attributes:
+        signals: Array of EEG signals with shape (n_subjects, n_channels, n_samples)
+        labels: Array of labels with shape (n_subjects,) - 0: Control, 1: AD
+        channel_names: List of EEG channel names
+        sampling_rate: Sampling frequency in Hz
+        subject_ids: List of subject identifiers
+        metadata: Optional metadata for each subject
+    """
+    signals: np.ndarray
+    labels: np.ndarray
+    channel_names: List[str]
+    sampling_rate: float
+    subject_ids: List[str]
+    metadata: Optional[List[Dict[str, Any]]] = None
+    
+    def __post_init__(self):
+        """Initialize metadata list if not provided."""
+        if self.metadata is None:
+            self.metadata = [{} for _ in range(len(self.subject_ids))]
+    
+    def validate(self) -> bool:
+        """
+        Validate the integrity of the entire dataset.
+        
+        Returns:
+            True if the dataset is valid, False otherwise
+            
+        Raises:
+            ValueError: If validation fails with specific error message
+        """
+        # Check signals shape
+        if self.signals.ndim != 3:
+            raise ValueError(
+                f"Signals must be 3D array (n_subjects, n_channels, n_samples), "
+                f"got shape {self.signals.shape}"
+            )
+        
+        n_subjects, n_channels, n_samples = self.signals.shape
+        
+        # Check labels shape and values
+        if self.labels.shape != (n_subjects,):
+            raise ValueError(
+                f"Labels shape {self.labels.shape} does not match "
+                f"number of subjects {n_subjects}"
+            )
+        
+        if not np.all(np.isin(self.labels, [0, 1])):
+            raise ValueError("All labels must be 0 (Control) or 1 (AD)")
+        
+        # Check channel names
+        if len(self.channel_names) != n_channels:
+            raise ValueError(
+                f"Number of channel names ({len(self.channel_names)}) "
+                f"does not match signal channels ({n_channels})"
+            )
+        
+        # Check subject IDs
+        if len(self.subject_ids) != n_subjects:
+            raise ValueError(
+                f"Number of subject IDs ({len(self.subject_ids)}) "
+                f"does not match number of subjects ({n_subjects})"
+            )
+        
+        # Check for duplicate subject IDs
+        if len(set(self.subject_ids)) != len(self.subject_ids):
+            raise ValueError("Subject IDs must be unique")
+        
+        # Check sampling rate
+        if self.sampling_rate <= 0:
+            raise ValueError(
+                f"Sampling rate must be positive, got {self.sampling_rate}"
+            )
+        
+        # Check metadata
+        if self.metadata is not None and len(self.metadata) != n_subjects:
+            raise ValueError(
+                f"Number of metadata entries ({len(self.metadata)}) "
+                f"does not match number of subjects ({n_subjects})"
+            )
+        
+        return True
+    
+    def __len__(self) -> int:
+        """Return the number of subjects in the dataset."""
+        return len(self.subject_ids)
+    
+    def get_sample(self, index: int) -> EEGSample:
+        """
+        Get a single EEG sample by index.
+        
+        Args:
+            index: Index of the sample to retrieve
+            
+        Returns:
+            EEGSample object for the specified index
+        """
+        if index < 0 or index >= len(self):
+            raise IndexError(f"Index {index} out of range for dataset of size {len(self)}")
+        
+        return EEGSample(
+            signal=self.signals[index],
+            label=int(self.labels[index]),
+            subject_id=self.subject_ids[index],
+            channel_names=self.channel_names,
+            sampling_rate=self.sampling_rate,
+            metadata=self.metadata[index] if self.metadata else {}
+        )
+    
+    def get_class_distribution(self) -> Dict[str, int]:
+        """
+        Get the distribution of classes in the dataset.
+        
+        Returns:
+            Dictionary with counts for each class
+        """
+        unique, counts = np.unique(self.labels, return_counts=True)
+        return {
+            'Control': int(counts[unique == 0][0]) if 0 in unique else 0,
+            'AD': int(counts[unique == 1][0]) if 1 in unique else 0
+        }
+
+
+@dataclass
+class PreprocessedDataset:
+    """
+    Container for preprocessed EEG epochs with train/val/test splits.
+    
+    Attributes:
+        epochs: List of EEGEpoch objects
+        train_indices: Indices for training set
+        val_indices: Indices for validation set
+        test_indices: Indices for test set
+        preprocessing_params: Parameters used for preprocessing
+    """
+    epochs: List[EEGEpoch]
+    train_indices: List[int]
+    val_indices: List[int]
+    test_indices: List[int]
+    preprocessing_params: Dict[str, Any] = field(default_factory=dict)
+    
+    def validate(self) -> bool:
+        """
+        Validate the integrity of the preprocessed dataset.
+        
+        Returns:
+            True if the dataset is valid, False otherwise
+            
+        Raises:
+            ValueError: If validation fails with specific error message
+        """
+        n_epochs = len(self.epochs)
+        
+        # Check that all indices are within bounds
+        all_indices = self.train_indices + self.val_indices + self.test_indices
+        if any(idx < 0 or idx >= n_epochs for idx in all_indices):
+            raise ValueError("Some indices are out of bounds")
+        
+        # Check for overlapping indices
+        train_set = set(self.train_indices)
+        val_set = set(self.val_indices)
+        test_set = set(self.test_indices)
+        
+        if train_set & val_set:
+            raise ValueError("Train and validation sets overlap")
+        if train_set & test_set:
+            raise ValueError("Train and test sets overlap")
+        if val_set & test_set:
+            raise ValueError("Validation and test sets overlap")
+        
+        return True
+    
+    def __len__(self) -> int:
+        """Return the total number of epochs."""
+        return len(self.epochs)
+
