@@ -1,0 +1,622 @@
+#!/usr/bin/env python
+"""
+Baseline comparison script for Alzheimer's Disease Detection from EEG.
+
+This script trains and evaluates all baseline models alongside the Transformer:
+1. Train all baseline models (CNN1D, CNN2D, LSTM, SVM, RF, XGBoost)
+2. Evaluate all models on the same test set
+3. Generate comparison report
+
+Usage:
+    python compare_baselines.py --config configs/default_config.yaml
+    python compare_baselines.py --config configs/default_config.yaml --synthetic
+
+Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, List, Tuple, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+# Add src to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from src.config_manager import ConfigManager
+from src.transformer import EEGTransformer
+from src.baselines import CNN1D, CNN2D, LSTMModel, ClassicalMLBaseline, create_baseline_model
+from src.training import TrainingPipeline, EEGDatasetWrapper
+from src.evaluator import (
+    Evaluator, EvaluationResults, compare_models, format_comparison_table,
+    save_results_json, save_results_csv
+)
+from src.logger import get_logger
+
+# Import data loading from train.py
+from train import load_data, preprocess_data, generate_synthetic_data
+
+logger = get_logger(__name__)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Compare baseline models for Alzheimer\'s disease detection from EEG'
+    )
+    parser.add_argument(
+        '--config', '-c',
+        type=str,
+        default='configs/default_config.yaml',
+        help='Path to configuration file'
+    )
+    parser.add_argument(
+        '--data_dir', '-d',
+        type=str,
+        default=None,
+        help='Override data directory from config'
+    )
+    parser.add_argument(
+        '--output_dir', '-o',
+        type=str,
+        default='results/baseline_comparison',
+        help='Output directory for comparison results'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed for reproducibility'
+    )
+    parser.add_argument(
+        '--synthetic',
+        action='store_true',
+        help='Use synthetic data for testing'
+    )
+    parser.add_argument(
+        '--models',
+        nargs='+',
+        default=['transformer', 'cnn1d', 'cnn2d', 'lstm', 'svm', 'rf'],
+        help='Models to compare (default: all)'
+    )
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=50,
+        help='Number of training epochs for neural network models'
+    )
+    return parser.parse_args()
+
+
+def split_data(
+    signals: np.ndarray,
+    labels: np.ndarray,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Split data into train/val/test sets with consistent indices.
+    
+    This ensures all models are trained and evaluated on identical data splits.
+    
+    Args:
+        signals: EEG signals (n_subjects, n_channels, n_samples)
+        labels: Labels (n_subjects,)
+        train_ratio: Proportion for training
+        val_ratio: Proportion for validation
+        test_ratio: Proportion for testing
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Tuple of (train_signals, train_labels, val_signals, val_labels, test_signals, test_labels)
+        
+    Requirements: 6.5
+    """
+    n_samples = len(labels)
+    indices = np.arange(n_samples)
+    
+    np.random.seed(seed)
+    np.random.shuffle(indices)
+    
+    train_end = int(n_samples * train_ratio)
+    val_end = train_end + int(n_samples * val_ratio)
+    
+    train_indices = indices[:train_end]
+    val_indices = indices[train_end:val_end]
+    test_indices = indices[val_end:]
+    
+    logger.info(f"Data split (seed={seed}): train={len(train_indices)}, val={len(val_indices)}, test={len(test_indices)}")
+    
+    return (
+        signals[train_indices], labels[train_indices],
+        signals[val_indices], labels[val_indices],
+        signals[test_indices], labels[test_indices]
+    )
+
+
+def train_neural_model(
+    model: nn.Module,
+    train_signals: np.ndarray,
+    train_labels: np.ndarray,
+    val_signals: np.ndarray,
+    val_labels: np.ndarray,
+    config: Dict[str, Any],
+    model_name: str,
+    checkpoint_dir: str
+) -> nn.Module:
+    """
+    Train a neural network model (Transformer, CNN, LSTM).
+    
+    Args:
+        model: PyTorch model to train
+        train_signals: Training signals
+        train_labels: Training labels
+        val_signals: Validation signals
+        val_labels: Validation labels
+        config: Training configuration
+        model_name: Name of the model for logging
+        checkpoint_dir: Directory for checkpoints
+        
+    Returns:
+        Trained model
+    """
+    logger.info(f"Training {model_name}...")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    
+    # Create training pipeline
+    model_checkpoint_dir = os.path.join(checkpoint_dir, model_name)
+    pipeline = TrainingPipeline(
+        model=model,
+        config=config,
+        device=device,
+        checkpoint_dir=model_checkpoint_dir
+    )
+    
+    # Train
+    results = pipeline.train(
+        train_signals=train_signals,
+        train_labels=train_labels,
+        val_signals=val_signals,
+        val_labels=val_labels,
+        save_checkpoints=True
+    )
+    
+    logger.info(f"{model_name} training complete - Best Val Loss: {results['best_val_loss']:.4f}")
+    
+    # Load best model
+    best_model_path = os.path.join(model_checkpoint_dir, 'best_model.pt')
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info(f"Loaded best {model_name} model")
+    
+    return model
+
+
+def evaluate_neural_model(
+    model: nn.Module,
+    test_signals: np.ndarray,
+    test_labels: np.ndarray,
+    device: torch.device
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Evaluate a neural network model on test data.
+    
+    Args:
+        model: Trained PyTorch model
+        test_signals: Test signals
+        test_labels: Test labels
+        device: Device for inference
+        
+    Returns:
+        Tuple of (predictions, probabilities)
+    """
+    model.eval()
+    model.to(device)
+    
+    all_preds = []
+    all_probs = []
+    
+    batch_size = 32
+    n_samples = len(test_labels)
+    
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            batch_signals = torch.from_numpy(
+                test_signals[i:i+batch_size]
+            ).float().to(device)
+            
+            # Handle different model forward signatures
+            if hasattr(model, 'forward'):
+                output = model(batch_signals)
+                if isinstance(output, tuple):
+                    logits = output[0]  # Transformer returns (logits, attention)
+                else:
+                    logits = output
+            else:
+                logits = model(batch_signals)
+            
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())
+    
+    return np.array(all_preds), np.array(all_probs)
+
+
+def train_and_evaluate_classical_ml(
+    classifier_type: str,
+    train_signals: np.ndarray,
+    train_labels: np.ndarray,
+    test_signals: np.ndarray,
+    test_labels: np.ndarray,
+    sampling_rate: float = 256.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Train and evaluate a classical ML model.
+    
+    Args:
+        classifier_type: Type of classifier ('svm', 'rf', 'xgboost')
+        train_signals: Training signals
+        train_labels: Training labels
+        test_signals: Test signals
+        test_labels: Test labels
+        sampling_rate: Sampling rate for feature extraction
+        
+    Returns:
+        Tuple of (predictions, probabilities)
+    """
+    logger.info(f"Training {classifier_type.upper()}...")
+    
+    model = ClassicalMLBaseline(
+        classifier_type=classifier_type,
+        sampling_rate=sampling_rate
+    )
+    
+    # Train
+    model.fit(train_signals, train_labels)
+    
+    # Evaluate
+    predictions = model.predict(test_signals)
+    probabilities = model.predict_proba(test_signals)[:, 1]
+    
+    accuracy = np.mean(predictions == test_labels)
+    logger.info(f"{classifier_type.upper()} training complete - Test Accuracy: {accuracy:.4f}")
+    
+    return predictions, probabilities
+
+
+def run_comparison(
+    signals: np.ndarray,
+    labels: np.ndarray,
+    config: Dict[str, Any],
+    models_to_compare: List[str],
+    output_dir: str,
+    checkpoint_dir: str,
+    sampling_rate: float = 256.0,
+    seed: int = 42
+) -> Dict[str, EvaluationResults]:
+    """
+    Run comparison of all specified models.
+    
+    Args:
+        signals: Preprocessed EEG signals
+        labels: Labels
+        config: Configuration dictionary
+        models_to_compare: List of model names to compare
+        output_dir: Output directory for results
+        checkpoint_dir: Checkpoint directory
+        sampling_rate: Sampling rate for classical ML feature extraction
+        seed: Random seed
+        
+    Returns:
+        Dictionary mapping model names to EvaluationResults
+        
+    Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
+    """
+    # Split data with consistent indices for all models
+    train_signals, train_labels, val_signals, val_labels, test_signals, test_labels = split_data(
+        signals, labels, seed=seed
+    )
+    
+    n_channels = signals.shape[1]
+    n_samples = signals.shape[2]
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+    
+    # Create evaluator
+    evaluator = Evaluator(output_dir=output_dir, save_visualizations=True)
+    
+    model_results = {}
+    
+    for model_name in models_to_compare:
+        logger.info(f"\n{'='*50}")
+        logger.info(f"Processing model: {model_name}")
+        logger.info(f"{'='*50}")
+        
+        try:
+            if model_name == 'transformer':
+                # Create and train Transformer
+                model_config = config.get('model', {})
+                model = EEGTransformer(
+                    n_channels=n_channels,
+                    n_samples=n_samples,
+                    patch_size=model_config.get('patch_size', 32),
+                    embedding_dim=model_config.get('embedding_dim', 128),
+                    num_heads=model_config.get('num_heads', 8),
+                    num_layers=model_config.get('num_layers', 6),
+                    feedforward_dim=model_config.get('feedforward_dim', 512),
+                    dropout=model_config.get('dropout', 0.1)
+                )
+                
+                model = train_neural_model(
+                    model, train_signals, train_labels,
+                    val_signals, val_labels, config,
+                    'Transformer', checkpoint_dir
+                )
+                
+                predictions, probabilities = evaluate_neural_model(
+                    model, test_signals, test_labels, device
+                )
+                
+            elif model_name == 'cnn1d':
+                # Create and train 1D CNN
+                model = CNN1D(
+                    n_channels=n_channels,
+                    n_samples=n_samples,
+                    num_classes=2
+                )
+                
+                model = train_neural_model(
+                    model, train_signals, train_labels,
+                    val_signals, val_labels, config,
+                    'CNN1D', checkpoint_dir
+                )
+                
+                predictions, probabilities = evaluate_neural_model(
+                    model, test_signals, test_labels, device
+                )
+                
+            elif model_name == 'cnn2d':
+                # Create and train 2D CNN
+                model = CNN2D(
+                    n_channels=n_channels,
+                    n_samples=n_samples,
+                    num_classes=2
+                )
+                
+                model = train_neural_model(
+                    model, train_signals, train_labels,
+                    val_signals, val_labels, config,
+                    'CNN2D', checkpoint_dir
+                )
+                
+                predictions, probabilities = evaluate_neural_model(
+                    model, test_signals, test_labels, device
+                )
+                
+            elif model_name == 'lstm':
+                # Create and train LSTM
+                model = LSTMModel(
+                    n_channels=n_channels,
+                    n_samples=n_samples,
+                    num_classes=2
+                )
+                
+                model = train_neural_model(
+                    model, train_signals, train_labels,
+                    val_signals, val_labels, config,
+                    'LSTM', checkpoint_dir
+                )
+                
+                predictions, probabilities = evaluate_neural_model(
+                    model, test_signals, test_labels, device
+                )
+                
+            elif model_name in ['svm', 'rf', 'xgboost']:
+                # Train and evaluate classical ML model
+                # Use combined train+val for classical ML (they don't need validation set)
+                combined_train_signals = np.concatenate([train_signals, val_signals], axis=0)
+                combined_train_labels = np.concatenate([train_labels, val_labels], axis=0)
+                
+                predictions, probabilities = train_and_evaluate_classical_ml(
+                    model_name,
+                    combined_train_signals, combined_train_labels,
+                    test_signals, test_labels,
+                    sampling_rate
+                )
+                
+            else:
+                logger.warning(f"Unknown model: {model_name}. Skipping.")
+                continue
+            
+            # Evaluate and store results
+            display_name = model_name.upper() if model_name in ['svm', 'rf', 'lstm'] else model_name.title()
+            results = evaluator.evaluate(
+                y_true=test_labels,
+                y_pred=predictions,
+                y_prob=probabilities,
+                model_name=display_name
+            )
+            
+            model_results[display_name] = results
+            
+            logger.info(f"{display_name} Results:")
+            logger.info(f"  Accuracy:  {results.accuracy:.4f}")
+            logger.info(f"  F1 Score:  {results.f1_score:.4f}")
+            logger.info(f"  ROC-AUC:   {results.roc_auc:.4f}")
+            
+        except Exception as e:
+            logger.error(f"Error training/evaluating {model_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    return model_results
+
+
+def generate_comparison_report(
+    model_results: Dict[str, EvaluationResults],
+    output_dir: str
+) -> None:
+    """
+    Generate and save comparison report.
+    
+    Args:
+        model_results: Dictionary of model results
+        output_dir: Output directory
+        
+    Requirements: 6.6
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate comparison
+    comparison = compare_models(model_results)
+    
+    # Print comparison table
+    logger.info("\n" + "="*80)
+    logger.info("MODEL COMPARISON RESULTS")
+    logger.info("="*80)
+    
+    table_str = format_comparison_table(model_results)
+    logger.info("\n" + table_str)
+    
+    # Print best model
+    if comparison['best_model']:
+        logger.info(f"\nBest Model (by F1 Score): {comparison['best_model']}")
+    
+    # Print rankings
+    logger.info("\nRankings by Metric:")
+    for metric, ranking in comparison['rankings'].items():
+        logger.info(f"  {metric}: {' > '.join(ranking)}")
+    
+    # Save comparison results
+    comparison_file = os.path.join(output_dir, 'comparison_results.json')
+    with open(comparison_file, 'w') as f:
+        # Convert EvaluationResults to dict for JSON serialization
+        serializable_comparison = {
+            'comparison_table': comparison['comparison_table'],
+            'best_model': comparison['best_model'],
+            'rankings': comparison['rankings'],
+            'timestamp': datetime.now().isoformat()
+        }
+        json.dump(serializable_comparison, f, indent=2)
+    logger.info(f"\nComparison results saved to {comparison_file}")
+    
+    # Save as CSV
+    csv_file = os.path.join(output_dir, 'comparison_results.csv')
+    save_results_csv(model_results, csv_file)
+    
+    # Save individual model results
+    for model_name, results in model_results.items():
+        model_file = os.path.join(output_dir, f'{model_name.lower()}_results.json')
+        save_results_json(results, model_file)
+    
+    # Save comparison table as text
+    table_file = os.path.join(output_dir, 'comparison_table.txt')
+    with open(table_file, 'w') as f:
+        f.write("MODEL COMPARISON RESULTS\n")
+        f.write("="*80 + "\n\n")
+        f.write(table_str + "\n\n")
+        f.write(f"Best Model (by F1 Score): {comparison['best_model']}\n\n")
+        f.write("Rankings by Metric:\n")
+        for metric, ranking in comparison['rankings'].items():
+            f.write(f"  {metric}: {' > '.join(ranking)}\n")
+    logger.info(f"Comparison table saved to {table_file}")
+
+
+def main():
+    """Main entry point for baseline comparison."""
+    args = parse_args()
+    
+    # Load configuration
+    logger.info(f"Loading configuration from {args.config}")
+    config_manager = ConfigManager(args.config)
+    config = config_manager.config
+    
+    # Override epochs if specified
+    if args.epochs:
+        if 'training' not in config:
+            config['training'] = {}
+        config['training']['num_epochs'] = args.epochs
+    
+    # Set random seeds
+    ConfigManager.set_random_seeds(args.seed)
+    logger.info(f"Random seed set to {args.seed}")
+    
+    # Set up directories
+    output_dir = args.output_dir
+    checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+    data_dir = args.data_dir or config.get('data', {}).get('data_dir', 'data/')
+    
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Log experiment info
+    logger.info("="*60)
+    logger.info("Baseline Model Comparison")
+    logger.info("="*60)
+    logger.info(f"Models to compare: {args.models}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Training epochs: {config.get('training', {}).get('num_epochs', 50)}")
+    
+    try:
+        # Load data
+        signals, labels, channel_names, sampling_rate = load_data(
+            config=config,
+            data_dir=data_dir,
+            use_synthetic=args.synthetic
+        )
+        
+        # Preprocess data
+        signals = preprocess_data(signals, config, sampling_rate)
+        
+        logger.info(f"Data shape: {signals.shape}")
+        logger.info(f"Class distribution: Control={np.sum(labels==0)}, AD={np.sum(labels==1)}")
+        
+        # Run comparison
+        model_results = run_comparison(
+            signals=signals,
+            labels=labels,
+            config=config,
+            models_to_compare=args.models,
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
+            sampling_rate=sampling_rate,
+            seed=args.seed
+        )
+        
+        # Generate comparison report
+        if model_results:
+            generate_comparison_report(model_results, output_dir)
+        else:
+            logger.error("No models were successfully trained and evaluated")
+            return 1
+        
+        logger.info("\n" + "="*60)
+        logger.info("Baseline comparison complete!")
+        logger.info("="*60)
+        
+        return 0
+        
+    except Exception as e:
+        logger.error(f"Comparison failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
