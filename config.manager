@@ -1,0 +1,266 @@
+"""
+Configuration management for the Alzheimer's EEG Detection system.
+
+This module provides the ConfigManager class for loading, validating, and managing
+configuration parameters from YAML files.
+"""
+
+import logging
+import random
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import numpy as np
+import yaml
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+
+class ConfigManager:
+    """Manages configuration loading, validation, and reproducibility settings."""
+    
+    def __init__(self, config_path: Optional[str] = None):
+        """
+        Initialize the ConfigManager.
+        
+        Args:
+            config_path: Path to the YAML configuration file. If None, uses default config.
+        """
+        self.config: Dict[str, Any] = {}
+        self.config_path = config_path
+        
+        if config_path:
+            self.load_config(config_path)
+    
+    def load_config(self, config_path: str) -> Dict[str, Any]:
+        """
+        Load configuration from a YAML file.
+        
+        Args:
+            config_path: Path to the YAML configuration file.
+            
+        Returns:
+            Dictionary containing the loaded configuration.
+            
+        Raises:
+            FileNotFoundError: If the configuration file doesn't exist.
+            yaml.YAMLError: If the YAML file is malformed.
+        """
+        config_file = Path(config_path)
+        
+        if not config_file.exists():
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
+        
+        try:
+            with open(config_file, 'r') as f:
+                self.config = yaml.safe_load(f)
+            
+            logging.info(f"Configuration loaded from {config_path}")
+            return self.config
+            
+        except yaml.YAMLError as e:
+            logging.error(f"Error parsing YAML configuration: {e}")
+            raise
+    
+    def validate_config(self, config: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Validate the configuration parameters.
+        
+        Args:
+            config: Configuration dictionary to validate. If None, validates self.config.
+            
+        Returns:
+            True if configuration is valid, False otherwise.
+        """
+        if config is None:
+            config = self.config
+        
+        if not config:
+            logging.error("Configuration is empty")
+            return False
+        
+        # Validate data configuration
+        if 'data' in config:
+            data_config = config['data']
+            
+            if 'sampling_rate' in data_config and data_config['sampling_rate'] <= 0:
+                logging.error("sampling_rate must be positive")
+                return False
+            
+            if 'epoch_duration' in data_config and data_config['epoch_duration'] <= 0:
+                logging.error("epoch_duration must be positive")
+                return False
+            
+            # Validate split ratios
+            if all(k in data_config for k in ['train_ratio', 'val_ratio', 'test_ratio']):
+                total_ratio = (data_config['train_ratio'] + 
+                             data_config['val_ratio'] + 
+                             data_config['test_ratio'])
+                if abs(total_ratio - 1.0) > 0.01:
+                    logging.error(f"Split ratios must sum to 1.0, got {total_ratio}")
+                    return False
+        
+        # Validate preprocessing configuration
+        if 'preprocessing' in config:
+            preproc_config = config['preprocessing']
+            
+            if 'bandpass_low' in preproc_config and preproc_config['bandpass_low'] < 0:
+                logging.error("bandpass_low must be non-negative")
+                return False
+            
+            if 'bandpass_high' in preproc_config and preproc_config['bandpass_high'] <= 0:
+                logging.error("bandpass_high must be positive")
+                return False
+            
+            if ('bandpass_low' in preproc_config and 'bandpass_high' in preproc_config and
+                preproc_config['bandpass_low'] >= preproc_config['bandpass_high']):
+                logging.error("bandpass_low must be less than bandpass_high")
+                return False
+        
+        # Validate model configuration
+        if 'model' in config:
+            model_config = config['model']
+            
+            if 'patch_size' in model_config and model_config['patch_size'] <= 0:
+                logging.error("patch_size must be positive")
+                return False
+            
+            if 'embedding_dim' in model_config and model_config['embedding_dim'] <= 0:
+                logging.error("embedding_dim must be positive")
+                return False
+            
+            if 'num_heads' in model_config and model_config['num_heads'] <= 0:
+                logging.error("num_heads must be positive")
+                return False
+            
+            if 'num_layers' in model_config and model_config['num_layers'] <= 0:
+                logging.error("num_layers must be positive")
+                return False
+            
+            if 'dropout' in model_config:
+                dropout = model_config['dropout']
+                if dropout < 0 or dropout >= 1:
+                    logging.error("dropout must be in range [0, 1)")
+                    return False
+        
+        # Validate training configuration
+        if 'training' in config:
+            train_config = config['training']
+            
+            if 'learning_rate' in train_config and train_config['learning_rate'] <= 0:
+                logging.error("learning_rate must be positive")
+                return False
+            
+            if 'batch_size' in train_config and train_config['batch_size'] <= 0:
+                logging.error("batch_size must be positive")
+                return False
+            
+            if 'num_epochs' in train_config and train_config['num_epochs'] <= 0:
+                logging.error("num_epochs must be positive")
+                return False
+            
+            if 'k_folds' in train_config and train_config['k_folds'] < 2:
+                logging.error("k_folds must be at least 2")
+                return False
+            
+            # Validate optimizer name
+            if 'optimizer' in train_config:
+                valid_optimizers = ['adam', 'adamw', 'sgd', 'rmsprop']
+                if train_config['optimizer'].lower() not in valid_optimizers:
+                    logging.error(f"Invalid optimizer: {train_config['optimizer']}. "
+                                f"Must be one of {valid_optimizers}")
+                    return False
+        
+        logging.info("Configuration validation passed")
+        return True
+    
+    def get_data_config(self) -> Dict[str, Any]:
+        """
+        Get the data configuration section.
+        
+        Returns:
+            Dictionary containing data configuration parameters.
+        """
+        return self.config.get('data', {})
+    
+    def get_model_config(self) -> Dict[str, Any]:
+        """
+        Get the model configuration section.
+        
+        Returns:
+            Dictionary containing model configuration parameters.
+        """
+        return self.config.get('model', {})
+    
+    def get_training_config(self) -> Dict[str, Any]:
+        """
+        Get the training configuration section.
+        
+        Returns:
+            Dictionary containing training configuration parameters.
+        """
+        return self.config.get('training', {})
+    
+    def get_preprocessing_config(self) -> Dict[str, Any]:
+        """
+        Get the preprocessing configuration section.
+        
+        Returns:
+            Dictionary containing preprocessing configuration parameters.
+        """
+        return self.config.get('preprocessing', {})
+    
+    def get_evaluation_config(self) -> Dict[str, Any]:
+        """
+        Get the evaluation configuration section.
+        
+        Returns:
+            Dictionary containing evaluation configuration parameters.
+        """
+        return self.config.get('evaluation', {})
+    
+    @staticmethod
+    def set_random_seeds(seed: int) -> None:
+        """
+        Set random seeds for reproducibility across NumPy, PyTorch, and Python random.
+        
+        Args:
+            seed: Random seed value to use.
+        """
+        # Set Python random seed
+        random.seed(seed)
+        
+        # Set NumPy random seed
+        np.random.seed(seed)
+        
+        # Set PyTorch random seeds if available
+        if TORCH_AVAILABLE:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            
+            # Configure PyTorch for deterministic behavior
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        
+        logging.info(f"Random seeds set to {seed} for reproducibility")
+    
+    def save_config(self, output_path: str) -> None:
+        """
+        Save the current configuration to a YAML file.
+        
+        Args:
+            output_path: Path where the configuration should be saved.
+        """
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_file, 'w') as f:
+            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
+        
+        logging.info(f"Configuration saved to {output_path}")
+
