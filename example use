@@ -1,0 +1,83 @@
+"""
+Example usage of the Alzheimer's EEG Detection System.
+
+This script demonstrates how to:
+1. Set up logging and configuration
+2. Train the Transformer model
+3. Compare baseline models
+4. Run inference on new data
+
+For full training and evaluation, use the dedicated scripts:
+- train.py: Main training script
+- compare_baselines.py: Baseline model comparison
+- inference.py: Run inference on new EEG data
+
+Example commands:
+    # Train with synthetic data (for testing)
+    python train.py --config configs/default_config.yaml --synthetic
+    
+    # Train with real data
+    python train.py --config configs/default_config.yaml --data_dir data/
+    
+    # Train with cross-validation
+    python train.py --config configs/default_config.yaml --synthetic --cross_validation
+    
+    # Compare baseline models
+    python compare_baselines.py --config configs/default_config.yaml --synthetic
+    
+    # Run inference on new data
+    python inference.py --model checkpoints/best_model.pt --input data/new_subject.edf
+"""
+
+from src import ConfigManager, setup_logging
+
+
+def main():
+    # Set up logging
+    logger = setup_logging(log_level="INFO")
+    logger.info("Starting Alzheimer's EEG Detection System")
+    
+    # Load configuration
+    config_manager = ConfigManager('configs/default_config.yaml')
+    logger.info("Configuration loaded successfully")
+    
+    # Validate configuration
+    if config_manager.validate_config():
+        logger.info("Configuration validation passed")
+    else:
+        logger.error("Configuration validation failed")
+        return
+    
+    # Set random seeds for reproducibility
+    seed = config_manager.config.get('seed', 42)
+    ConfigManager.set_random_seeds(seed)
+    logger.info(f"Random seeds set to {seed}")
+    
+    # Display configuration sections
+    logger.info("Data configuration:")
+    data_config = config_manager.get_data_config()
+    for key, value in data_config.items():
+        logger.info(f"  {key}: {value}")
+    
+    logger.info("Model configuration:")
+    model_config = config_manager.get_model_config()
+    for key, value in model_config.items():
+        logger.info(f"  {key}: {value}")
+    
+    logger.info("Training configuration:")
+    training_config = config_manager.get_training_config()
+    for key, value in training_config.items():
+        logger.info(f"  {key}: {value}")
+    
+    logger.info("System setup complete and ready for training")
+    logger.info("")
+    logger.info("To train the model, run:")
+    logger.info("  python train.py --config configs/default_config.yaml --synthetic")
+    logger.info("")
+    logger.info("To compare baseline models, run:")
+    logger.info("  python compare_baselines.py --config configs/default_config.yaml --synthetic")
+
+
+if __name__ == "__main__":
+    main()
+
